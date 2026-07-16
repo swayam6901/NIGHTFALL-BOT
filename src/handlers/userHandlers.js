@@ -26,6 +26,53 @@ async function getChannelInviteLink(telegram, channel) {
 }
 
 /**
+ * Builds the caption for a delivered file: keeps the admin's original
+ * caption (if any) and appends the "Join Channel" promo line underneath.
+ */
+function buildDeliveryCaption(originalCaption) {
+  const joinLine = config.JOIN_CHANNEL_USERNAME
+    ? `📢 Join Channel: ${config.JOIN_CHANNEL_USERNAME}`
+    : '';
+
+  if (!joinLine) return originalCaption || undefined;
+  return originalCaption ? `${originalCaption}\n\n${joinLine}` : joinLine;
+}
+
+/**
+ * Schedules the delivered batch to be deleted after config.AUTO_DELETE_SECONDS,
+ * then replaces it with a "Previous Message was Deleted" recovery prompt with
+ * a button to re-trigger delivery.
+ */
+function scheduleAutoDelete(telegram, userId, batchId, messageIds) {
+  if (config.AUTO_DELETE_SECONDS <= 0 || messageIds.length === 0) return;
+
+  setTimeout(async () => {
+    for (const messageId of messageIds) {
+      await telegram.deleteMessage(userId, messageId).catch(() => {});
+    }
+
+    await telegram
+      .sendMessage(
+        userId,
+        '<b>Previous Message was Deleted</b>\n' +
+          '<blockquote>If you want to get the files again, then click the button below, else close this message.</blockquote>',
+        {
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '♻️ Click Here', callback_data: `redeliver:${batchId}` },
+                { text: '❌ Close', callback_data: 'closeprompt' },
+              ],
+            ],
+          },
+        }
+      )
+      .catch(() => {});
+  }, config.AUTO_DELETE_SECONDS * 1000);
+}
+
+/**
  * Attempts to deliver a batch to a user. Runs force-join check, then
  * premium/daily-limit check, then queues the actual file copies.
  * Used both from /start deep-link and from the Verify button callback.
@@ -87,11 +134,16 @@ async function attemptDelivery(ctx, batchId, userId) {
   await ctx.reply(`Sending ${messages.length} file(s)...`);
 
   let failCount = 0;
+  const sentMessageIds = [];
   for (const msg of messages) {
     try {
-      await deliveryQueue.enqueue(() =>
-        ctx.telegram.copyMessage(userId, config.STORAGE_CHANNEL_ID, msg.message_id)
+      const sent = await deliveryQueue.enqueue(() =>
+        ctx.telegram.copyMessage(userId, config.STORAGE_CHANNEL_ID, msg.message_id, {
+          caption: buildDeliveryCaption(msg.caption),
+          protect_content: true, // blocks saving/forwarding on the recipient's end
+        })
       );
+      sentMessageIds.push(sent.message_id);
     } catch (err) {
       failCount += 1;
       console.error(`[delivery] failed to deliver message ${msg.message_id} to ${userId}:`, err.message);
@@ -107,6 +159,8 @@ async function attemptDelivery(ctx, batchId, userId) {
   if (failCount > 0) {
     await ctx.reply(`Done, but ${failCount} file(s) failed to send. Contact an admin if this persists.`);
   }
+
+  scheduleAutoDelete(ctx.telegram, userId, batchId, sentMessageIds);
 }
 
 function registerUserHandlers(bot) {
@@ -136,6 +190,20 @@ function registerUserHandlers(bot) {
 
     await ctx.deleteMessage().catch(() => {}); // clean up the join-prompt message
     await attemptDelivery(ctx, batchId, ctx.from.id);
+  });
+
+  // ---------- "Click Here" on the recovery prompt (re-deliver a batch) ----------
+  bot.action(/^redeliver:(.+)$/, async (ctx) => {
+    const batchId = ctx.match[1];
+    await ctx.answerCbQuery('Sending your files again...');
+    await ctx.deleteMessage().catch(() => {}); // clean up the recovery prompt
+    await attemptDelivery(ctx, batchId, ctx.from.id);
+  });
+
+  // ---------- "Close" on the recovery prompt ----------
+  bot.action('closeprompt', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.deleteMessage().catch(() => {});
   });
 
   bot.action('noop', async (ctx) => {
