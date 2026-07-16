@@ -1,8 +1,23 @@
 const config = require('../config');
 const db = require('../db/queries');
 const { generateUniqueBatchId } = require('../utils/batchId');
-const { uploadSessions } = require('../state');
+const { uploadSessions, thumbnailSessions } = require('../state');
 const { invalidateCache, requireAdmin } = require('../middleware/adminAuth');
+
+/** Parses a duration arg like "7d" / "30d" / "365d" into a day count.
+ *  Returns null for "lifetime" (no arg given). Returns NaN if the arg is
+ *  present but malformed, so the caller can show a usage error. */
+function parseDurationArg(arg) {
+  if (!arg) return null; // no arg = lifetime
+  const match = /^(\d+)d$/i.exec(arg.trim());
+  if (!match) return NaN;
+  return Number(match[1]);
+}
+
+/** Fills {link} and {count} placeholders in a caption template. */
+function fillCaptionTemplate(template, link, count) {
+  return template.replace(/\{link\}/g, link).replace(/\{count\}/g, String(count));
+}
 
 function registerAdminHandlers(bot) {
   const adminOnly = requireAdmin();
@@ -25,6 +40,57 @@ function registerAdminHandlers(bot) {
     await ctx.reply(
       `Upload mode started.\nBatch ID: ${batchId}\n\nSend any files now (videos, docs, images, zips, etc). Send /done when finished, or /cancel to discard.`
     );
+  });
+
+  // ---------- Thumbnail intake (right after /done) ----------
+  // Must be registered BEFORE the generic file-intake handler below so a
+  // photo sent while a thumbnail session is pending doesn't get swallowed
+  // into a new batch instead.
+  bot.on('photo', async (ctx, next) => {
+    const adminId = ctx.from.id;
+    const pending = thumbnailSessions.get(adminId);
+    if (!pending) return next(); // no pending thumbnail request - fall through
+
+    thumbnailSessions.delete(adminId);
+
+    if (!config.POSTING_CHANNEL_ID) {
+      return ctx.reply(
+        'POSTING_CHANNEL_ID is not configured, so I cannot post this. Set it in your env vars and redeploy. The batch itself is fine - the link above still works.'
+      );
+    }
+
+    const customCaption = ctx.message.caption && ctx.message.caption.trim();
+    const caption = customCaption
+      ? `${customCaption}\n\n🔗 ${pending.link}`
+      : fillCaptionTemplate(
+          config.POST_CAPTIONS[Math.floor(Math.random() * config.POST_CAPTIONS.length)],
+          pending.link,
+          pending.fileCount
+        );
+
+    const largestPhoto = ctx.message.photo[ctx.message.photo.length - 1];
+
+    try {
+      await ctx.telegram.sendPhoto(config.POSTING_CHANNEL_ID, largestPhoto.file_id, { caption });
+      await ctx.reply(
+        `Posted to the posting channel ${customCaption ? '(your caption)' : '(random caption)'}.`
+      );
+    } catch (err) {
+      console.error('[thumbnail] failed to post to posting channel:', err.message);
+      await ctx.reply(
+        'Failed to post - make sure the bot is admin in the posting channel. The batch link itself is unaffected.'
+      );
+    }
+  });
+
+  // ---------- /skip (skip the thumbnail/posting step) ----------
+  bot.command('skip', adminOnly, async (ctx) => {
+    const adminId = ctx.from.id;
+    if (!thumbnailSessions.has(adminId)) {
+      return ctx.reply('Nothing to skip - no pending thumbnail request.');
+    }
+    thumbnailSessions.delete(adminId);
+    await ctx.reply('Skipped. No promo post sent - the batch link above still works.');
   });
 
   // ---------- File intake during an active session ----------
@@ -81,6 +147,15 @@ function registerAdminHandlers(bot) {
     await ctx.reply(
       `Batch Created\n\nFiles: ${session.fileOrder}\nBatch ID: ${session.batchId}\n\nDownload Link:\n${link}`
     );
+
+    thumbnailSessions.set(adminId, { batchId: session.batchId, link, fileCount: session.fileOrder });
+    await ctx.reply(
+      'Send a thumbnail photo now to post this batch in the posting channel:\n\n' +
+        '• Photo *with* a caption -> uses your caption + the link\n' +
+        '• Photo with *no* caption -> picks a random caption from the pool + the link\n' +
+        '• /skip -> don\'t post anywhere, just keep the link above',
+      { parse_mode: 'Markdown' }
+    );
   });
 
   // ---------- /cancel ----------
@@ -132,21 +207,47 @@ function registerAdminHandlers(bot) {
     );
   });
 
-  // ---------- /premium <user_id> (admin grant) ----------
-  // Note: /premium with NO args is also a user-facing "show premium info"
-  // command (see userHandlers.js). We only intercept it here when an admin
-  // supplies a target user_id; otherwise we pass through to the next handler.
+  // ---------- /premium <user_id> [7d|30d|365d] (admin grant) ----------
+  // Blank duration = lifetime (no expiry). Note: /premium with NO args at
+  // all is also a user-facing "show plans" command (see userHandlers.js).
+  // We only intercept it here when an admin supplies a target user_id;
+  // otherwise we pass through to the next handler.
   bot.command('premium', async (ctx, next) => {
     const parts = ctx.message.text.trim().split(/\s+/);
     const targetId = Number(parts[1]);
 
-    if (!targetId) return next(); // no args - let userHandlers show premium info
+    if (!targetId) return next(); // no args - let userHandlers show plans
 
     const admin = await db.isAdmin(ctx.from.id);
-    if (!admin) return next(); // non-admin typed "/premium 12345" - just show info instead
+    if (!admin) return next(); // non-admin typed "/premium 12345" - just show plans instead
 
-    await db.setPremium(targetId, true);
-    await ctx.reply(`User ${targetId} is now Premium.`);
+    const days = parseDurationArg(parts[2]);
+    if (Number.isNaN(days)) {
+      return ctx.reply('Usage: /premium <user_id> [7d|30d|365d]  (leave duration blank for lifetime)');
+    }
+
+    const { expiry } = await db.grantPremium(targetId, days ? `${days}d` : 'lifetime', days);
+
+    const planLabel = days ? `${days} day${days === 1 ? '' : 's'}` : 'Lifetime';
+    await ctx.reply(
+      `User ${targetId} is now Premium.\nPlan: ${planLabel}${
+        expiry ? `\nExpires: ${new Date(expiry).toISOString().split('T')[0]}` : ''
+      }`
+    );
+
+    const userMessage =
+      `🎉 Congratulations! You've been upgraded to *Premium*.\n\n` +
+      `Plan: ${planLabel}${expiry ? `\nExpires: ${new Date(expiry).toISOString().split('T')[0]}` : ''}\n\n` +
+      `Enjoy unlimited downloads with no daily limit!`;
+
+    try {
+      await ctx.telegram.sendMessage(targetId, userMessage, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error(`[premium] failed to notify user ${targetId}:`, err.message);
+      await ctx.reply(
+        `(Note: could not DM user ${targetId} - they may not have started the bot yet. Their Premium is active regardless.)`
+      );
+    }
   });
 
   // ---------- /unpremium <user_id> ----------
@@ -155,7 +256,7 @@ function registerAdminHandlers(bot) {
     const targetId = Number(parts[1]);
     if (!targetId) return ctx.reply('Usage: /unpremium <user_id>');
 
-    await db.setPremium(targetId, false);
+    await db.revokePremium(targetId);
     await ctx.reply(`User ${targetId} Premium removed.`);
   });
 
