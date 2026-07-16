@@ -60,13 +60,52 @@ async function updateUser(telegramId, fields) {
   if (error) throw error;
 }
 
-async function setPremium(telegramId, premium) {
+/**
+ * Grants premium to a user.
+ * @param {number} telegramId
+ * @param {string} planId - e.g. '1week', '1month', '6months', 'lifetime'
+ * @param {number|null} days - number of days from now, or null for lifetime (no expiry)
+ * @returns {{expiry: string|null}} the computed expiry (ISO string) or null for lifetime
+ */
+async function grantPremium(telegramId, planId, days) {
+  await getOrCreateUser(telegramId); // ensure row exists
+  const expiry = days ? new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString() : null;
+
+  const { error } = await supabase
+    .from('users')
+    .update({ premium: true, premium_plan: planId, premium_expiry: expiry })
+    .eq('telegram_id', telegramId);
+  if (error) throw error;
+
+  return { expiry };
+}
+
+/** Revokes premium entirely (used by /unpremium). */
+async function revokePremium(telegramId) {
   await getOrCreateUser(telegramId); // ensure row exists
   const { error } = await supabase
     .from('users')
-    .update({ premium })
+    .update({ premium: false, premium_plan: null, premium_expiry: null })
     .eq('telegram_id', telegramId);
   if (error) throw error;
+}
+
+/**
+ * Lazy expiry check: if a user's premium_expiry has passed, downgrades them
+ * to free in the DB and returns the corrected user object. Lifetime premium
+ * (premium_expiry === null while premium === true) never expires this way.
+ * Call this anywhere a user's current premium status matters (delivery,
+ * /info, /premium) so a stale `premium: true` row never grants access past
+ * its paid-for window.
+ */
+async function checkAndExpirePremium(user) {
+  if (!user.premium || !user.premium_expiry) return user; // free, or lifetime - nothing to do
+
+  const expired = new Date(user.premium_expiry).getTime() <= Date.now();
+  if (!expired) return user;
+
+  await revokePremium(user.telegram_id);
+  return { ...user, premium: false, premium_plan: null, premium_expiry: null };
 }
 
 // ---------- Batches ----------
@@ -188,7 +227,9 @@ module.exports = {
   listAdmins,
   getOrCreateUser,
   updateUser,
-  setPremium,
+  grantPremium,
+  revokePremium,
+  checkAndExpirePremium,
   batchIdExists,
   createBatch,
   addBatchMessage,
