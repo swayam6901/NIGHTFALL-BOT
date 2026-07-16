@@ -25,4 +25,11 @@ module.exports = {
   PORT: process.env.PORT || 3000,
   WEBHOOK_SECRET_PATH: process.env.WEBHOOK_SECRET_PATH || 'webhook-secret',
   FREE_DAILY_LIMIT: 3,
+
+  // Shown on every delivered file's caption, e.g. "@YourChannel"
+  JOIN_CHANNEL_USERNAME: process.env.JOIN_CHANNEL_USERNAME || '',
+
+  // How long (seconds) a delivered batch stays before being auto-deleted and
+  // replaced with the "click here to get files again" prompt. 0 disables it.
+  AUTO_DELETE_SECONDS: Number(process.env.AUTO_DELETE_SECONDS) || 600,
 };
