@@ -90,11 +90,12 @@ async function createBatch(batchId, createdBy) {
   if (error) throw error;
 }
 
-async function addBatchMessage(batchId, messageId, fileOrder) {
+async function addBatchMessage(batchId, messageId, fileOrder, caption = null) {
   const { error } = await supabase.from('batch_messages').insert({
     batch_id: batchId,
     message_id: messageId,
     file_order: fileOrder,
+    caption,
   });
   if (error) throw error;
 }
@@ -130,7 +131,7 @@ async function getBatch(batchId) {
 async function getBatchMessages(batchId) {
   const { data, error } = await supabase
     .from('batch_messages')
-    .select('message_id, file_order')
+    .select('message_id, file_order, caption')
     .eq('batch_id', batchId)
     .order('file_order', { ascending: true });
   if (error) throw error;
