@@ -6,9 +6,10 @@ const { pendingRequests } = require('../state');
 const deliveryQueue = require('../queue/deliveryQueue');
 
 /**
- * Attempts to deliver a batch to a user. Runs force-join check, then
- * premium/daily-limit check, then queues the actual file copies.
- * Used both from /start deep-link and from the Verify button callback.
+ * Returns a usable join link for the force-join channel.
+ * Public channels: https://t.me/<username>
+ * Private channels: needs an actual invite link, generated via
+ * exportChatInviteLink if the bot doesn't already have one.
  */
 async function getChannelInviteLink(telegram, channel) {
   try {
@@ -23,24 +24,33 @@ async function getChannelInviteLink(telegram, channel) {
     return null;
   }
 }
-if (channel) {
-  const joined = await isJoined(ctx.telegram, userId);
-  if (!joined) {
-    pendingRequests.set(userId, batchId);
-    const inviteLink = await getChannelInviteLink(ctx.telegram, channel);
 
-    return ctx.reply('You must join our channel to continue.', {
-      reply_markup: {
-        inline_keyboard: [
-          inviteLink
-            ? [{ text: 'Join Channel', url: inviteLink }]
-            : [{ text: 'Join Channel (contact admin - link unavailable)', callback_data: 'noop' }],
-          [{ text: 'Verify', callback_data: `verify:${batchId}` }],
-        ],
-      },
-    });
+/**
+ * Attempts to deliver a batch to a user. Runs force-join check, then
+ * premium/daily-limit check, then queues the actual file copies.
+ * Used both from /start deep-link and from the Verify button callback.
+ */
+async function attemptDelivery(ctx, batchId, userId) {
+  const channel = await getForceJoinChannel();
+
+  if (channel) {
+    const joined = await isJoined(ctx.telegram, userId);
+    if (!joined) {
+      pendingRequests.set(userId, batchId);
+      const inviteLink = await getChannelInviteLink(ctx.telegram, channel);
+
+      return ctx.reply('You must join our channel to continue.', {
+        reply_markup: {
+          inline_keyboard: [
+            inviteLink
+              ? [{ text: 'Join Channel', url: inviteLink }]
+              : [{ text: 'Join Channel (contact admin - link unavailable)', callback_data: 'noop' }],
+            [{ text: 'Verify', callback_data: `verify:${batchId}` }],
+          ],
+        },
+      });
+    }
   }
-}
 
   const batch = await db.getBatch(batchId);
   if (!batch) {
