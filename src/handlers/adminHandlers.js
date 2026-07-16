@@ -41,7 +41,10 @@ function registerAdminHandlers(bot) {
         ctx.message.message_id
       );
       session.fileOrder += 1;
-      await db.addBatchMessage(session.batchId, copied.message_id, session.fileOrder);
+      // Preserve whatever caption the admin sent with the file (if any) so it
+      // can be re-tagged with the join-channel promo line at delivery time.
+      const originalCaption = ctx.message.caption || null;
+      await db.addBatchMessage(session.batchId, copied.message_id, session.fileOrder, originalCaption);
 
       // Lightweight ack every file so admin has feedback without spamming
       if (session.fileOrder % 5 === 0) {
