@@ -10,28 +10,37 @@ const deliveryQueue = require('../queue/deliveryQueue');
  * premium/daily-limit check, then queues the actual file copies.
  * Used both from /start deep-link and from the Verify button callback.
  */
-async function attemptDelivery(ctx, batchId, userId) {
-  const channel = await getForceJoinChannel();
+async function getChannelInviteLink(telegram, channel) {
+  try {
+    const chat = await telegram.getChat(channel);
+    if (chat.username) return `https://t.me/${chat.username}`;
+    if (chat.invite_link) return chat.invite_link;
 
-  if (channel) {
-    const joined = await isJoined(ctx.telegram, userId);
-    if (!joined) {
-      pendingRequests.set(userId, batchId);
-      const chat = await ctx.telegram.getChat(channel).catch(() => null);
-      const inviteLink = chat && chat.username ? `https://t.me/${chat.username}` : null;
-
-      return ctx.reply('You must join our channel to continue.', {
-        reply_markup: {
-          inline_keyboard: [
-            inviteLink
-              ? [{ text: 'Join Channel', url: inviteLink }]
-              : [{ text: 'Join Channel', callback_data: 'noop' }],
-            [{ text: 'Verify', callback_data: `verify:${batchId}` }],
-          ],
-        },
-      });
-    }
+    const exported = await telegram.exportChatInviteLink(channel);
+    return exported || null;
+  } catch (err) {
+    console.error('[forceJoin] Failed to resolve invite link:', err.message);
+    return null;
   }
+}
+if (channel) {
+  const joined = await isJoined(ctx.telegram, userId);
+  if (!joined) {
+    pendingRequests.set(userId, batchId);
+    const inviteLink = await getChannelInviteLink(ctx.telegram, channel);
+
+    return ctx.reply('You must join our channel to continue.', {
+      reply_markup: {
+        inline_keyboard: [
+          inviteLink
+            ? [{ text: 'Join Channel', url: inviteLink }]
+            : [{ text: 'Join Channel (contact admin - link unavailable)', callback_data: 'noop' }],
+          [{ text: 'Verify', callback_data: `verify:${batchId}` }],
+        ],
+      },
+    });
+  }
+}
 
   const batch = await db.getBatch(batchId);
   if (!batch) {
